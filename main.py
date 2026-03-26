@@ -8,8 +8,8 @@ import logging
 import os
 import threading
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
-import pytz
 import yfinance as yf
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from flask import Flask, jsonify
@@ -31,7 +31,7 @@ BOT_TOKEN: str = os.environ["BOT_TOKEN"]
 CHAT_ID: str = os.environ["CHAT_ID"]
 PORT: int = int(os.environ.get("PORT", 8080))
 
-BEIRUT_TZ = pytz.timezone("Europe/Beirut")
+BEIRUT_TZ = ZoneInfo("Asia/Beirut")
 
 TICKERS: dict[str, str] = {
     "NG=F": "Natural Gas",
@@ -69,7 +69,6 @@ def fetch_prices() -> dict[str, dict]:
     """
     Fetch latest price data for all configured tickers.
     Isolates per-ticker failures so one bad ticker never breaks the report.
-    Returns a dict keyed by ticker symbol.
     """
     results: dict[str, dict] = {}
 
@@ -82,7 +81,6 @@ def fetch_prices() -> dict[str, dict]:
             prev_close = getattr(info, "previous_close", None)
 
             if price is None:
-                # Fallback: pull 2-day history
                 hist = data.history(period="2d")
                 if not hist.empty:
                     price = float(hist["Close"].iloc[-1])
@@ -105,7 +103,7 @@ def fetch_prices() -> dict[str, dict]:
                 "error": None,
             }
 
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.error("Failed to fetch %s: %s", ticker, exc)
             results[ticker] = {"label": label, "error": str(exc)}
 
@@ -120,7 +118,7 @@ def build_report(prices: dict[str, dict], title: str = "Daily Fuel & Gas Report"
 
     for ticker, data in prices.items():
         if data.get("error"):
-            lines.append(f"• *{data['label']}* (`{ticker}`): ⚠️ {data['error']}")
+            lines.append(f"* *{data['label']}* (`{ticker}`): {data['error']}")
             continue
 
         arrow = "🟢" if (data["change"] or 0) >= 0 else "🔴"
@@ -134,7 +132,7 @@ def build_report(prices: dict[str, dict], title: str = "Daily Fuel & Gas Report"
                 f"({sign}{data['pct_change']:.2f}%)"
             )
 
-        lines.append(f"• *{data['label']}* (`{ticker}`)")
+        lines.append(f"* *{data['label']}* (`{ticker}`)")
         lines.append(f"  Price: `{price_str}`{change_str}")
         lines.append("")
 
@@ -174,7 +172,7 @@ async def send_daily_report(bot: Bot) -> None:
             parse_mode=ParseMode.MARKDOWN,
         )
         logger.info("Daily report sent successfully.")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.error("Failed to send daily report: %s", exc)
 
 
@@ -182,9 +180,8 @@ async def send_daily_report(bot: Bot) -> None:
 
 def run_bot() -> None:
     """
-    Runs in a dedicated thread.
-    Creates its own asyncio event loop, starts the APScheduler,
-    and runs the python-telegram-bot Application via run_polling().
+    Runs in a dedicated thread with its own asyncio event loop.
+    Starts APScheduler and runs the Telegram bot via run_polling().
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -209,12 +206,11 @@ def run_bot() -> None:
         args=[bot],
         id="daily_fuel_report",
         replace_existing=True,
-        misfire_grace_time=300,  # 5-min grace for Render cold starts
+        misfire_grace_time=300,
     )
     scheduler.start()
     logger.info("Scheduler started. Daily report scheduled at 00:00 Asia/Beirut (UTC+2).")
 
-    # run_polling manages the loop internally; pass the existing loop
     application.run_polling(
         allowed_updates=["message"],
         drop_pending_updates=True,
@@ -229,9 +225,8 @@ def start_bot_thread() -> None:
     logger.info("Telegram bot thread started.")
 
 
-# Start the bot thread when gunicorn imports this module
+# Triggered at gunicorn import time
 start_bot_thread()
 
 if __name__ == "__main__":
-    # Local dev only — gunicorn does NOT call this block
     app.run(host="0.0.0.0", port=PORT, debug=False)
