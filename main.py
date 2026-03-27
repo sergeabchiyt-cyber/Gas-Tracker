@@ -1,6 +1,7 @@
 """
 Fuel & Gas Price Tracker — Telegram Bot
 Render Free Tier | Flask + APScheduler + python-telegram-bot v20+
+Data Source: IPT Group Lebanon via AUDITOR scraping API
 """
 
 import asyncio
@@ -10,7 +11,7 @@ import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import yfinance as yf
+import requests
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from flask import Flask, jsonify
 from telegram.constants import ParseMode
@@ -28,23 +29,13 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN: str = os.environ["BOT_TOKEN"]
 CHAT_ID: str = os.environ["CHAT_ID"]
+AUDITOR_API_KEY: str = os.environ["AUDITOR_API_KEY"]
 PORT: int = int(os.environ.get("PORT", 8080))
 
 BEIRUT_TZ = ZoneInfo("Asia/Beirut")
 
-TICKERS: dict[str, str] = {
-    "NG=F": "Natural Gas",
-    "RB=F": "Gasoline (RBOB)",
-    "HO=F": "Heating Oil",
-    "BZ=F": "Brent Crude",
-}
-
-UNITS: dict[str, str] = {
-    "NG=F": "MMBtu",
-    "RB=F": "gallon",
-    "HO=F": "gallon",
-    "BZ=F": "barrel",
-}
+AUDITOR_ENDPOINT = "https://web-scraping-production.up.railway.app/api/scrape"
+IPT_URL = "https://www.iptgroup.com.lb/ipt/en/our-stations/fuel-prices"
 
 # ─── Flask App ───────────────────────────────────────────────────────────────
 
@@ -64,74 +55,105 @@ def status():
 
 # ─── Price Fetcher ───────────────────────────────────────────────────────────
 
-def fetch_prices() -> dict[str, dict]:
-    results: dict[str, dict] = {}
+def fetch_prices() -> dict:
+    """
+    Scrapes IPT Group Lebanon fuel prices via AUDITOR API.
+    IPT site is server-rendered — js: False is sufficient.
+    """
+    try:
+        response = requests.post(
+            AUDITOR_ENDPOINT,
+            headers={
+                "X-Api-Key": AUDITOR_API_KEY,
+                "Content-Type": "application/json",
+            },
+            json={
+                "url": IPT_URL,
+                "js": False,
+                "adaptive": True,
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        data = response.json()
+        logger.info("AUDITOR response received. Keys: %s", list(data.keys()) if isinstance(data, dict) else type(data))
+        return {"success": True, "data": data}
 
-    for ticker, label in TICKERS.items():
-        try:
-            data = yf.Ticker(ticker)
-            info = data.fast_info
-
-            price = getattr(info, "last_price", None)
-            prev_close = getattr(info, "previous_close", None)
-
-            if price is None:
-                hist = data.history(period="2d")
-                if not hist.empty:
-                    price = float(hist["Close"].iloc[-1])
-                    prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else None
-
-            if price is None:
-                results[ticker] = {"label": label, "error": "No data returned"}
-                continue
-
-            change = price - prev_close if prev_close else None
-            pct_change = (change / prev_close * 100) if prev_close else None
-
-            results[ticker] = {
-                "label": label,
-                "price": round(price, 4),
-                "prev_close": round(prev_close, 4) if prev_close else None,
-                "change": round(change, 4) if change is not None else None,
-                "pct_change": round(pct_change, 2) if pct_change is not None else None,
-                "unit": UNITS[ticker],
-                "error": None,
-            }
-
-        except Exception as exc:
-            logger.error("Failed to fetch %s: %s", ticker, exc)
-            results[ticker] = {"label": label, "error": str(exc)}
-
-    return results
+    except requests.exceptions.Timeout:
+        logger.error("AUDITOR request timed out.")
+        return {"success": False, "error": "Request timed out after 60s"}
+    except requests.exceptions.HTTPError as exc:
+        logger.error("AUDITOR HTTP error: %s", exc)
+        return {"success": False, "error": f"HTTP {exc.response.status_code}"}
+    except Exception as exc:
+        logger.error("AUDITOR fetch failed: %s", exc)
+        return {"success": False, "error": str(exc)}
 
 
 # ─── Message Builder ─────────────────────────────────────────────────────────
 
-def build_report(prices: dict[str, dict], title: str = "Daily Fuel & Gas Report") -> str:
+def build_report(result: dict, title: str = "IPT Fuel Prices — Lebanon") -> str:
     now = datetime.now(BEIRUT_TZ).strftime("%Y-%m-%d %H:%M %Z")
     lines = [f"*{title}*", f"_{now}_", ""]
 
-    for ticker, data in prices.items():
-        if data.get("error"):
-            lines.append(f"* *{data['label']}* (`{ticker}`): {data['error']}")
+    if not result["success"]:
+        lines.append(f"⚠️ Failed to fetch prices: {result['error']}")
+        return "\n".join(lines)
+
+    data = result["data"]
+
+    # AUDITOR returns structured data — iterate whatever fields are present
+    # Handles both list-of-items and dict-of-items response shapes
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        # Look for a nested list key (e.g. "results", "data", "items", "prices")
+        items = None
+        for key in ("results", "data", "items", "prices", "fuel_prices"):
+            if key in data and isinstance(data[key], list):
+                items = data[key]
+                break
+        if items is None:
+            # Flat dict — treat each key/value as a price entry
+            for k, v in data.items():
+                lines.append(f"• *{k}*: `{v}`")
+            lines.append("")
+            lines.append("_Source: IPT Group Lebanon_")
+            return "\n".join(lines)
+    else:
+        lines.append("⚠️ Unexpected response format from AUDITOR.")
+        return "\n".join(lines)
+
+    if not items:
+        lines.append("⚠️ No price data found in response.")
+        return "\n".join(lines)
+
+    for item in items:
+        if not isinstance(item, dict):
             continue
 
-        arrow = "🟢" if (data["change"] or 0) >= 0 else "🔴"
-        sign = "+" if (data["change"] or 0) >= 0 else ""
+        # Flexibly extract label and price from whatever keys AUDITOR infers
+        label = (
+            item.get("fuel_type")
+            or item.get("type")
+            or item.get("name")
+            or item.get("product")
+            or item.get("label")
+            or "Unknown"
+        )
+        price = (
+            item.get("price")
+            or item.get("value")
+            or item.get("amount")
+            or item.get("cost")
+            or "N/A"
+        )
+        unit = item.get("unit") or item.get("currency") or "LBP"
 
-        price_str = f"${data['price']:.4f}/{data['unit']}"
-        change_str = ""
-        if data["change"] is not None:
-            change_str = (
-                f"  {arrow} {sign}{data['change']:.4f} "
-                f"({sign}{data['pct_change']:.2f}%)"
-            )
+        lines.append(f"• *{label}*: `{price} {unit}`")
 
-        lines.append(f"* *{data['label']}* (`{ticker}`)")
-        lines.append(f"  Price: `{price_str}`{change_str}")
-        lines.append("")
-
-    lines.append("_Source: Yahoo Finance via yfinance_")
+    lines.append("")
+    lines.append("_Source: IPT Group Lebanon_")
     return "\n".join(lines)
 
 
@@ -139,9 +161,9 @@ def build_report(prices: dict[str, dict], title: str = "Daily Fuel & Gas Report"
 
 async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "⛽ *Fuel & Gas Price Tracker*\n\n"
+        "⛽ *IPT Fuel Price Tracker — Lebanon*\n\n"
         "Commands:\n"
-        "/prices — Fetch current prices\n"
+        "/prices — Fetch current IPT fuel prices\n"
         "/start — Show this message",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -149,8 +171,8 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_prices(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Fetching prices...", parse_mode=ParseMode.MARKDOWN)
-    prices = fetch_prices()
-    report = build_report(prices, title="Current Fuel & Gas Prices")
+    result = fetch_prices()
+    report = build_report(result, title="Current IPT Fuel Prices — Lebanon")
     await update.message.reply_text(report, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -159,8 +181,8 @@ async def cmd_prices(update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def send_daily_report(bot) -> None:
     logger.info("Sending scheduled daily report to chat %s", CHAT_ID)
     try:
-        prices = fetch_prices()
-        report = build_report(prices)
+        result = fetch_prices()
+        report = build_report(result)
         await bot.send_message(
             chat_id=CHAT_ID,
             text=report,
@@ -209,7 +231,7 @@ def run_bot() -> None:
         )
 
         logger.info("Bot polling started.")
-        await asyncio.Event().wait()  # block forever without signal handlers
+        await asyncio.Event().wait()
 
     loop.run_until_complete(_run())
 
