@@ -3,5 +3,5 @@ gunicorn==23.0.0
 gevent==24.11.1
 python-telegram-bot==21.10
 APScheduler==3.10.4
-yfinance==0.2.54
+requests==2.32.3
 tzdata==2024.2
