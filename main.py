@@ -13,7 +13,6 @@ from zoneinfo import ZoneInfo
 import yfinance as yf
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from flask import Flask, jsonify
-from telegram import Bot
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -66,10 +65,6 @@ def status():
 # ─── Price Fetcher ───────────────────────────────────────────────────────────
 
 def fetch_prices() -> dict[str, dict]:
-    """
-    Fetch latest price data for all configured tickers.
-    Isolates per-ticker failures so one bad ticker never breaks the report.
-    """
     results: dict[str, dict] = {}
 
     for ticker, label in TICKERS.items():
@@ -161,7 +156,7 @@ async def cmd_prices(update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── Scheduled Daily Report ──────────────────────────────────────────────────
 
-async def send_daily_report(bot: Bot) -> None:
+async def send_daily_report(bot) -> None:
     logger.info("Sending scheduled daily report to chat %s", CHAT_ID)
     try:
         prices = fetch_prices()
@@ -179,42 +174,44 @@ async def send_daily_report(bot: Bot) -> None:
 # ─── Bot + Scheduler Runner ──────────────────────────────────────────────────
 
 def run_bot() -> None:
-    """
-    Runs in a dedicated thread with its own asyncio event loop.
-    Starts APScheduler and runs the Telegram bot via run_polling().
-    """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
+    async def _run():
+        application = (
+            Application.builder()
+            .token(BOT_TOKEN)
+            .build()
+        )
 
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("prices", cmd_prices))
+        application.add_handler(CommandHandler("start", cmd_start))
+        application.add_handler(CommandHandler("prices", cmd_prices))
 
-    bot = Bot(token=BOT_TOKEN)
+        scheduler = AsyncIOScheduler(timezone=BEIRUT_TZ)
+        scheduler.add_job(
+            send_daily_report,
+            trigger="cron",
+            hour=0,
+            minute=0,
+            args=[application.bot],
+            id="daily_fuel_report",
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
+        scheduler.start()
+        logger.info("Scheduler started. Daily report scheduled at 00:00 Asia/Beirut (UTC+2).")
 
-    scheduler = AsyncIOScheduler(timezone=BEIRUT_TZ)
-    scheduler.add_job(
-        send_daily_report,
-        trigger="cron",
-        hour=0,
-        minute=0,
-        args=[bot],
-        id="daily_fuel_report",
-        replace_existing=True,
-        misfire_grace_time=300,
-    )
-    scheduler.start()
-    logger.info("Scheduler started. Daily report scheduled at 00:00 Asia/Beirut (UTC+2).")
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(
+            allowed_updates=["message"],
+            drop_pending_updates=True,
+        )
 
-    application.run_polling(
-        allowed_updates=["message"],
-        drop_pending_updates=True,
-    )
+        logger.info("Bot polling started.")
+        await asyncio.Event().wait()  # block forever without signal handlers
+
+    loop.run_until_complete(_run())
 
 
 # ─── Entry Point ─────────────────────────────────────────────────────────────
