@@ -37,6 +37,13 @@ BEIRUT_TZ = ZoneInfo("Asia/Beirut")
 AUDITOR_ENDPOINT = "https://web-scraping-production.up.railway.app/api/scrape"
 IPT_URL = "https://www.iptgroup.com.lb/ipt/en/our-stations/fuel-prices"
 
+FUEL_LABELS = {
+    "unl_95":  ("⛽", "Unleaded 95"),
+    "unl_98":  ("🔵", "Unleaded 98"),
+    "diesel":  ("🟡", "Diesel"),
+    "gas_lpg": ("🟠", "Gas / LPG"),
+}
+
 # ─── Flask App ───────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -90,31 +97,44 @@ def fetch_prices() -> dict:
 
 def build_report(result: dict, title: str = "IPT Fuel Prices — Lebanon") -> str:
     now = datetime.now(BEIRUT_TZ).strftime("%Y-%m-%d %H:%M %Z")
-    lines = [f"*{title}*", f"_{now}_", ""]
 
     if not result["success"]:
-        lines.append(f"⚠️ Failed to fetch prices: {result['error']}")
-        return "\n".join(lines)
+        return f"*{title}*\n_{now}_\n\n⚠️ {result['error']}"
 
     data = result["data"]
 
-    def flatten(obj, indent=0):
-        prefix = "  " * indent
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if isinstance(v, (dict, list)):
-                    lines.append(f"{prefix}*{k}*:")
-                    flatten(v, indent + 1)
-                else:
-                    lines.append(f"{prefix}• *{k}*: `{v}`")
-        elif isinstance(obj, list):
-            for item in obj:
-                flatten(item, indent)
-                lines.append("")
-        else:
-            lines.append(f"{prefix}• `{obj}`")
+    # Pull records from `data` key only — single source of truth, no duplication
+    records = data.get("data") if isinstance(data, dict) else None
+    if not records or not isinstance(records, list):
+        return f"*{title}*\n_{now}_\n\n⚠️ No records found in response."
 
-    flatten(data)
+    # De-duplicate by fuel_type — keep first occurrence
+    seen = set()
+    unique_records = []
+    for r in records:
+        ft = r.get("fuel_type", "").lower()
+        if ft and ft not in seen:
+            seen.add(ft)
+            unique_records.append(r)
+
+    date_str = unique_records[0].get("date", "N/A") if unique_records else "N/A"
+
+    lines = [
+        f"*{title}*",
+        f"📅 _{date_str}_",
+        f"🕐 _{now}_",
+        "─────────────────",
+    ]
+
+    for r in unique_records:
+        ft = r.get("fuel_type", "unknown").lower()
+        price = r.get("price_ll", "N/A")
+        currency = r.get("currency", "L.L.")
+        emoji, label = FUEL_LABELS.get(ft, ("🔹", ft.upper()))
+        lines.append(f"{emoji} *{label}*")
+        lines.append(f"    `{price} {currency}`")
+
+    lines.append("─────────────────")
     lines.append("_Source: IPT Group Lebanon_")
     return "\n".join(lines)
 
