@@ -37,13 +37,6 @@ BEIRUT_TZ = ZoneInfo("Asia/Beirut")
 AUDITOR_ENDPOINT = "https://web-scraping-production.up.railway.app/api/scrape"
 IPT_URL = "https://www.iptgroup.com.lb/ipt/en/our-stations/fuel-prices"
 
-FUEL_LABELS = {
-    "unl_95":  ("⛽", "Unleaded 95"),
-    "unl_98":  ("🔵", "Unleaded 98"),
-    "diesel":  ("🟡", "Diesel"),
-    "gas_lpg": ("🟠", "Gas / LPG"),
-}
-
 # ─── Flask App ───────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -93,6 +86,30 @@ def fetch_prices() -> dict:
         return {"success": False, "error": str(exc)}
 
 
+# ─── Dynamic Field Detection ─────────────────────────────────────────────────
+
+def detect_field(record: dict, candidates: list[str]) -> str | None:
+    """Return the first key in record that contains any of the candidate substrings."""
+    for key in record:
+        for c in candidates:
+            if c in key.lower():
+                return key
+    return None
+
+
+def fuel_emoji(label: str) -> str:
+    l = label.lower().replace(" ", "").replace("_", "")
+    if "95" in l:
+        return "⛽"
+    if "98" in l:
+        return "🔵"
+    if "diesel" in l:
+        return "🟡"
+    if "lpg" in l or "gas" in l:
+        return "🟠"
+    return "🔹"
+
+
 # ─── Message Builder ─────────────────────────────────────────────────────────
 
 def build_report(result: dict, title: str = "IPT Fuel Prices — Lebanon") -> str:
@@ -103,21 +120,25 @@ def build_report(result: dict, title: str = "IPT Fuel Prices — Lebanon") -> st
 
     data = result["data"]
 
-    # Pull records from `data` key only — single source of truth, no duplication
+    # Pull records from `data` key — single source of truth
     records = data.get("data") if isinstance(data, dict) else None
     if not records or not isinstance(records, list):
         return f"*{title}*\n_{now}_\n\n⚠️ No records found in response."
 
-    # De-duplicate by fuel_type — keep first occurrence
+    # De-duplicate: use fuel type field value as dedup key
     seen = set()
     unique_records = []
     for r in records:
-        ft = r.get("fuel_type", "").lower()
-        if ft and ft not in seen:
-            seen.add(ft)
+        fuel_key = detect_field(r, ["fuel", "type", "product", "name", "label"])
+        dedup_val = str(r.get(fuel_key, id(r))).lower() if fuel_key else str(id(r))
+        if dedup_val not in seen:
+            seen.add(dedup_val)
             unique_records.append(r)
 
-    date_str = unique_records[0].get("date", "N/A") if unique_records else "N/A"
+    # Extract date from first record dynamically
+    first = unique_records[0] if unique_records else {}
+    date_key = detect_field(first, ["date", "time", "updated"])
+    date_str = first.get(date_key, "N/A") if date_key else "N/A"
 
     lines = [
         f"*{title}*",
@@ -126,13 +147,27 @@ def build_report(result: dict, title: str = "IPT Fuel Prices — Lebanon") -> st
         "─────────────────",
     ]
 
+    # Skip these keys from per-record display — shown in header already
+    skip_keys = {date_key, "currency", "date", "time", "updated_at"}
+
     for r in unique_records:
-        ft = r.get("fuel_type", "unknown").lower()
-        price = r.get("price_ll", "N/A")
-        currency = r.get("currency", "L.L.")
-        emoji, label = FUEL_LABELS.get(ft, ("🔹", ft.upper()))
-        lines.append(f"{emoji} *{label}*")
-        lines.append(f"    `{price} {currency}`")
+        fuel_key = detect_field(r, ["fuel", "type", "product", "name", "label"])
+        price_key = detect_field(r, ["price", "cost", "value", "amount", "rate"])
+        currency_key = detect_field(r, ["currency", "unit", "cur"])
+
+        fuel_label = str(r.get(fuel_key, "Unknown")).replace("_", " ").upper() if fuel_key else "Unknown"
+        price_val = str(r.get(price_key, "N/A")) if price_key else "N/A"
+        currency_val = str(r.get(currency_key, "L.L.")) if currency_key else "L.L."
+
+        emoji = fuel_emoji(fuel_label)
+        lines.append(f"{emoji} *{fuel_label}*")
+        lines.append(f"    `{price_val} {currency_val}`")
+
+        # Append any extra fields that aren't already shown
+        shown = {fuel_key, price_key, currency_key} | skip_keys
+        for k, v in r.items():
+            if k not in shown and v not in (None, "", "N/A"):
+                lines.append(f"    _{k}: {v}_")
 
     lines.append("─────────────────")
     lines.append("_Source: IPT Group Lebanon_")
