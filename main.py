@@ -56,10 +56,6 @@ def status():
 # ─── Price Fetcher ───────────────────────────────────────────────────────────
 
 def fetch_prices() -> dict:
-    """
-    Scrapes IPT Group Lebanon fuel prices via AUDITOR API.
-    IPT site is server-rendered — js: False is sufficient.
-    """
     try:
         response = requests.post(
             AUDITOR_ENDPOINT,
@@ -76,7 +72,7 @@ def fetch_prices() -> dict:
         )
         response.raise_for_status()
         data = response.json()
-        logger.info("AUDITOR response received. Keys: %s", list(data.keys()) if isinstance(data, dict) else type(data))
+        logger.info("AUDITOR response received.")
         return {"success": True, "data": data}
 
     except requests.exceptions.Timeout:
@@ -102,57 +98,23 @@ def build_report(result: dict, title: str = "IPT Fuel Prices — Lebanon") -> st
 
     data = result["data"]
 
-    # AUDITOR returns structured data — iterate whatever fields are present
-    # Handles both list-of-items and dict-of-items response shapes
-    if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict):
-        # Look for a nested list key (e.g. "results", "data", "items", "prices")
-        items = None
-        for key in ("results", "data", "items", "prices", "fuel_prices"):
-            if key in data and isinstance(data[key], list):
-                items = data[key]
-                break
-        if items is None:
-            # Flat dict — treat each key/value as a price entry
-            for k, v in data.items():
-                lines.append(f"• *{k}*: `{v}`")
-            lines.append("")
-            lines.append("_Source: IPT Group Lebanon_")
-            return "\n".join(lines)
-    else:
-        lines.append("⚠️ Unexpected response format from AUDITOR.")
-        return "\n".join(lines)
+    def flatten(obj, indent=0):
+        prefix = "  " * indent
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, (dict, list)):
+                    lines.append(f"{prefix}*{k}*:")
+                    flatten(v, indent + 1)
+                else:
+                    lines.append(f"{prefix}• *{k}*: `{v}`")
+        elif isinstance(obj, list):
+            for item in obj:
+                flatten(item, indent)
+                lines.append("")
+        else:
+            lines.append(f"{prefix}• `{obj}`")
 
-    if not items:
-        lines.append("⚠️ No price data found in response.")
-        return "\n".join(lines)
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-
-        # Flexibly extract label and price from whatever keys AUDITOR infers
-        label = (
-            item.get("fuel_type")
-            or item.get("type")
-            or item.get("name")
-            or item.get("product")
-            or item.get("label")
-            or "Unknown"
-        )
-        price = (
-            item.get("price")
-            or item.get("value")
-            or item.get("amount")
-            or item.get("cost")
-            or "N/A"
-        )
-        unit = item.get("unit") or item.get("currency") or "LBP"
-
-        lines.append(f"• *{label}*: `{price} {unit}`")
-
-    lines.append("")
+    flatten(data)
     lines.append("_Source: IPT Group Lebanon_")
     return "\n".join(lines)
 
