@@ -34,7 +34,7 @@ PORT: int = int(os.environ.get("PORT", 8080))
 
 BEIRUT_TZ = ZoneInfo("Asia/Beirut")
 
-AUDITOR_ENDPOINT = "https://web-scraping-production.up.railway.app/api/scrape"
+AUDITOR_ENDPOINT = "https://web-scraping-production-ce3e.up.railway.app/api/scrape"
 IPT_URL = "https://www.iptgroup.com.lb/ipt/en/our-stations/fuel-prices"
 
 # ─── Flask App ───────────────────────────────────────────────────────────────
