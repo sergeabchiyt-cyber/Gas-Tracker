@@ -28,13 +28,13 @@ logger = logging.getLogger(__name__)
 # ─── Config ─────────────────────────────────────────────────────────────────
 
 BOT_TOKEN: str = os.environ["BOT_TOKEN"]
-CHAT_ID: str = os.environ["CHAT_ID"]
+CHAT_ID: str = os.environ.get("CHAT_ID", "")
 AUDITOR_API_KEY: str = os.environ["AUDITOR_API_KEY"]
 PORT: int = int(os.environ.get("PORT", 8080))
 
 BEIRUT_TZ = ZoneInfo("Asia/Beirut")
 
-AUDITOR_ENDPOINT = "https://web-scraping-production-ce3e.up.railway.app/api/scrape"
+AUDITOR_ENDPOINT = "https://web-scraping-production.up.railway.app/api/scrape"
 IPT_URL = "https://www.iptgroup.com.lb/ipt/en/our-stations/fuel-prices"
 
 # ─── Flask App ───────────────────────────────────────────────────────────────
@@ -227,18 +227,21 @@ def run_bot() -> None:
         application.add_handler(CommandHandler("prices", cmd_prices))
 
         scheduler = AsyncIOScheduler(timezone=BEIRUT_TZ)
-        scheduler.add_job(
-            send_daily_report,
-            trigger="cron",
-            hour=0,
-            minute=0,
-            args=[application.bot],
-            id="daily_fuel_report",
-            replace_existing=True,
-            misfire_grace_time=300,
-        )
+        if CHAT_ID:
+            scheduler.add_job(
+                send_daily_report,
+                trigger="cron",
+                hour=0,
+                minute=0,
+                args=[application.bot],
+                id="daily_fuel_report",
+                replace_existing=True,
+                misfire_grace_time=300,
+            )
+            logger.info("Scheduler started. Daily report scheduled at 00:00 Asia/Beirut (UTC+2).")
+        else:
+            logger.warning("CHAT_ID not set — scheduled daily report disabled.")
         scheduler.start()
-        logger.info("Scheduler started. Daily report scheduled at 00:00 Asia/Beirut (UTC+2).")
 
         await application.initialize()
         await application.start()
