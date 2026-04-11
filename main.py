@@ -1,17 +1,19 @@
 """
-Fuel & Gas Price Tracker — Telegram Bot
+IPT Fuel Price Tracker — Telegram Bot
 Render Free Tier | Flask + APScheduler + python-telegram-bot v20+
-Data Source: IPT Group Lebanon via AUDITOR scraping API
+Data Source: IPT Group Lebanon via AUDITOR /api/raw + BeautifulSoup (no AI)
 """
 
 import asyncio
 import logging
 import os
+import re
 import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
+from bs4 import BeautifulSoup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from flask import Flask, jsonify
 from telegram.constants import ParseMode
@@ -27,15 +29,23 @@ logger = logging.getLogger(__name__)
 
 # ─── Config ─────────────────────────────────────────────────────────────────
 
-BOT_TOKEN: str = os.environ["BOT_TOKEN"]
-CHAT_ID: str = os.environ.get("CHAT_ID", "")
+BOT_TOKEN:       str = os.environ["BOT_TOKEN"]
+CHAT_ID:         str = os.environ.get("CHAT_ID", "")
 AUDITOR_API_KEY: str = os.environ["AUDITOR_API_KEY"]
-PORT: int = int(os.environ.get("PORT", 8080))
+PORT:            int = int(os.environ.get("PORT", 8080))
 
 BEIRUT_TZ = ZoneInfo("Asia/Beirut")
 
-AUDITOR_ENDPOINT = "https://web-scraping-production.up.railway.app/api/scrape"
-IPT_URL = "https://www.iptgroup.com.lb/ipt/en/our-stations/fuel-prices"
+AUDITOR_RAW_ENDPOINT = "https://web-scraping-production.up.railway.app/api/raw"
+IPT_URL              = "https://www.iptgroup.com.lb/ipt/en/our-stations/fuel-prices"
+
+FUEL_EMOJIS = {
+    "95":     "⛽",
+    "98":     "🔵",
+    "diesel": "🟡",
+    "lpg":    "🟠",
+    "gas":    "🟠",
+}
 
 # ─── Flask App ───────────────────────────────────────────────────────────────
 
@@ -53,30 +63,37 @@ def status():
     return jsonify({"status": "ok", "time_beirut": now_beirut}), 200
 
 
-# ─── Price Fetcher ───────────────────────────────────────────────────────────
+# ─── Raw Fetcher ─────────────────────────────────────────────────────────────
 
-def fetch_prices() -> dict:
+def fetch_raw_html() -> dict:
+    """
+    Calls AUDITOR /api/raw — returns preprocessed, table-isolated HTML.
+    No AI involved. Zero token cost.
+    """
     try:
         response = requests.post(
-            AUDITOR_ENDPOINT,
+            AUDITOR_RAW_ENDPOINT,
             headers={
-                "X-Api-Key": AUDITOR_API_KEY,
+                "X-Api-Key":    AUDITOR_API_KEY,
                 "Content-Type": "application/json",
             },
-            json={
-                "url": IPT_URL,
-                "js": False,
-                "adaptive": True,
-            },
+            json={"url": IPT_URL, "js": False, "adaptive": True},
             timeout=60,
         )
         response.raise_for_status()
         data = response.json()
-        logger.info("AUDITOR response received.")
-        return {"success": True, "data": data}
+        content = data.get("content", "")
+        if not content:
+            return {"success": False, "error": "Empty content in AUDITOR response"}
+        logger.info(
+            "AUDITOR /api/raw OK — %d isolated chars in %ss",
+            data.get("isolated_chars", 0),
+            data.get("elapsed", "?"),
+        )
+        return {"success": True, "content": content}
 
     except requests.exceptions.Timeout:
-        logger.error("AUDITOR request timed out.")
+        logger.error("AUDITOR /api/raw timed out.")
         return {"success": False, "error": "Request timed out after 60s"}
     except requests.exceptions.HTTPError as exc:
         logger.error("AUDITOR HTTP error: %s", exc)
@@ -86,92 +103,156 @@ def fetch_prices() -> dict:
         return {"success": False, "error": str(exc)}
 
 
-# ─── Dynamic Field Detection ─────────────────────────────────────────────────
+# ─── HTML Parser ─────────────────────────────────────────────────────────────
 
-def detect_field(record: dict, candidates: list[str]) -> str | None:
-    """Return the first key in record that contains any of the candidate substrings."""
-    for key in record:
-        for c in candidates:
-            if c in key.lower():
-                return key
-    return None
+NUMBER_RE = re.compile(r"[\d,]+(?:\.\d+)?")
 
 
 def fuel_emoji(label: str) -> str:
-    l = label.lower().replace(" ", "").replace("_", "")
-    if "95" in l:
-        return "⛽"
-    if "98" in l:
-        return "🔵"
-    if "diesel" in l:
-        return "🟡"
-    if "lpg" in l or "gas" in l:
-        return "🟠"
+    l = label.lower()
+    for key, emoji in FUEL_EMOJIS.items():
+        if key in l:
+            return emoji
     return "🔹"
+
+
+def parse_fuel_table(html: str) -> list[dict]:
+    """
+    Multi-strategy BeautifulSoup parser.
+    Strategy 1: <table> with rows where one cell is a label, another is a price.
+    Strategy 2: Any element containing a price pattern adjacent to a fuel name.
+    Strategy 3: Broad text scan — find lines that match 'FUEL_NAME ... NUMBER ... L.L.'
+    Returns list of {label, price, currency} dicts.
+    """
+    soup    = BeautifulSoup(html, "html.parser")
+    results = []
+
+    # ── Strategy 1: Table rows ───────────────────────────────────────────────
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        for row in rows:
+            cells = [c.get_text(separator=" ", strip=True) for c in row.find_all(["td", "th"])]
+            if len(cells) < 2:
+                continue
+            label_cell = cells[0]
+            # Find first cell that looks like a price
+            price_cell = next(
+                (c for c in cells[1:] if NUMBER_RE.search(c) and len(c) < 60),
+                None,
+            )
+            if not price_cell:
+                continue
+            label = label_cell.strip()
+            if not label or len(label) > 60:
+                continue
+            # Filter out header-looking rows
+            if label.lower() in ("fuel", "type", "price", "product", "name", "label"):
+                continue
+            price_match = NUMBER_RE.search(price_cell)
+            price = price_match.group(0) if price_match else price_cell.strip()
+            currency = "L.L." if re.search(r"L\.?L\.?", price_cell, re.IGNORECASE) else ""
+            results.append({"label": label, "price": price, "currency": currency})
+
+    if results:
+        logger.info("Strategy 1 (table) found %d records", len(results))
+        return _deduplicate(results)
+
+    # ── Strategy 2: Paired siblings / parent containers ──────────────────────
+    price_pattern = re.compile(r"\b\d[\d,]*(?:\.\d+)?\s*(L\.?L\.?|USD|\$)", re.IGNORECASE)
+    for el in soup.find_all(True):
+        text = el.get_text(separator=" ", strip=True)
+        if not price_pattern.search(text):
+            continue
+        if len(el.find_all(True)) > 15:  # skip large containers
+            continue
+        children = [c for c in el.children if hasattr(c, "get_text")]
+        if len(children) >= 2:
+            label = children[0].get_text(strip=True)
+            price_text = " ".join(c.get_text(strip=True) for c in children[1:])
+            if label and len(label) < 60 and price_pattern.search(price_text):
+                m = NUMBER_RE.search(price_text)
+                price = m.group(0) if m else price_text
+                currency = "L.L." if re.search(r"L\.?L\.?", price_text, re.IGNORECASE) else ""
+                results.append({"label": label, "price": price, "currency": currency})
+
+    if results:
+        logger.info("Strategy 2 (siblings) found %d records", len(results))
+        return _deduplicate(results)
+
+    # ── Strategy 3: Full-text line scan ──────────────────────────────────────
+    full_text = soup.get_text(separator="\n")
+    line_re   = re.compile(
+        r"([A-Za-z][A-Za-z0-9 /()]{1,40})\s+(\d[\d,]*(?:\.\d+)?)\s*(L\.?L\.?|USD|\$)?",
+        re.IGNORECASE,
+    )
+    for line in full_text.splitlines():
+        m = line_re.search(line)
+        if m:
+            results.append({
+                "label":    m.group(1).strip(),
+                "price":    m.group(2).strip(),
+                "currency": m.group(3).strip() if m.group(3) else "L.L.",
+            })
+
+    if results:
+        logger.info("Strategy 3 (text scan) found %d records", len(results))
+
+    return _deduplicate(results)
+
+
+def _deduplicate(records: list[dict]) -> list[dict]:
+    """Remove duplicate labels (case-insensitive, keep first occurrence)."""
+    seen   = set()
+    unique = []
+    for r in records:
+        key = r.get("label", "").lower().strip()
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(r)
+    return unique
 
 
 # ─── Message Builder ─────────────────────────────────────────────────────────
 
-def build_report(result: dict, title: str = "IPT Fuel Prices — Lebanon") -> str:
+def build_report(records: list[dict] | None, error: str | None,
+                 title: str = "IPT Fuel Prices — Lebanon") -> str:
     now = datetime.now(BEIRUT_TZ).strftime("%Y-%m-%d %H:%M %Z")
 
-    if not result["success"]:
-        return f"*{title}*\n_{now}_\n\n⚠️ {result['error']}"
+    if error:
+        return f"*{title}*\n_{now}_\n\n⚠️ {error}"
 
-    data = result["data"]
-
-    # Pull records from `data` key — single source of truth
-    records = data.get("data") if isinstance(data, dict) else None
-    if not records or not isinstance(records, list):
-        return f"*{title}*\n_{now}_\n\n⚠️ No records found in response."
-
-    # De-duplicate: use fuel type field value as dedup key
-    seen = set()
-    unique_records = []
-    for r in records:
-        fuel_key = detect_field(r, ["fuel", "type", "product", "name", "label"])
-        dedup_val = str(r.get(fuel_key, id(r))).lower() if fuel_key else str(id(r))
-        if dedup_val not in seen:
-            seen.add(dedup_val)
-            unique_records.append(r)
-
-    # Extract date from first record dynamically
-    first = unique_records[0] if unique_records else {}
-    date_key = detect_field(first, ["date", "time", "updated"])
-    date_str = first.get(date_key, "N/A") if date_key else "N/A"
+    if not records:
+        return f"*{title}*\n_{now}_\n\n⚠️ No price data found."
 
     lines = [
         f"*{title}*",
-        f"📅 _{date_str}_",
         f"🕐 _{now}_",
         "─────────────────",
     ]
 
-    # Skip these keys from per-record display — shown in header already
-    skip_keys = {date_key, "currency", "date", "time", "updated_at"}
-
-    for r in unique_records:
-        fuel_key = detect_field(r, ["fuel", "type", "product", "name", "label"])
-        price_key = detect_field(r, ["price", "cost", "value", "amount", "rate"])
-        currency_key = detect_field(r, ["currency", "unit", "cur"])
-
-        fuel_label = str(r.get(fuel_key, "Unknown")).replace("_", " ").upper() if fuel_key else "Unknown"
-        price_val = str(r.get(price_key, "N/A")) if price_key else "N/A"
-        currency_val = str(r.get(currency_key, "L.L.")) if currency_key else "L.L."
-
-        emoji = fuel_emoji(fuel_label)
-        lines.append(f"{emoji} *{fuel_label}*")
-        lines.append(f"    `{price_val} {currency_val}`")
-
-        # Append any extra fields that aren't already shown
-        shown = {fuel_key, price_key, currency_key} | skip_keys
-        for k, v in r.items():
-            if k not in shown and v not in (None, "", "N/A"):
-                lines.append(f"    _{k}: {v}_")
+    for r in records:
+        label    = r.get("label", "Unknown")
+        price    = r.get("price", "N/A")
+        currency = r.get("currency", "L.L.")
+        emoji    = fuel_emoji(label)
+        lines.append(f"{emoji} *{label}*")
+        lines.append(f"    `{price} {currency}`")
 
     lines.append("─────────────────")
     lines.append("_Source: IPT Group Lebanon_")
     return "\n".join(lines)
+
+
+# ─── Price Fetch + Parse ─────────────────────────────────────────────────────
+
+def fetch_prices() -> tuple[list[dict] | None, str | None]:
+    result = fetch_raw_html()
+    if not result["success"]:
+        return None, result["error"]
+    records = parse_fuel_table(result["content"])
+    if not records:
+        return None, "Parser found no price records in the preprocessed HTML."
+    return records, None
 
 
 # ─── Telegram Handlers ───────────────────────────────────────────────────────
@@ -188,8 +269,8 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_prices(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Fetching prices...", parse_mode=ParseMode.MARKDOWN)
-    result = fetch_prices()
-    report = build_report(result, title="Current IPT Fuel Prices — Lebanon")
+    records, error = fetch_prices()
+    report = build_report(records, error, title="Current IPT Fuel Prices — Lebanon")
     await update.message.reply_text(report, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -198,8 +279,8 @@ async def cmd_prices(update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def send_daily_report(bot) -> None:
     logger.info("Sending scheduled daily report to chat %s", CHAT_ID)
     try:
-        result = fetch_prices()
-        report = build_report(result)
+        records, error = fetch_prices()
+        report = build_report(records, error)
         await bot.send_message(
             chat_id=CHAT_ID,
             text=report,
@@ -217,12 +298,7 @@ def run_bot() -> None:
     asyncio.set_event_loop(loop)
 
     async def _run():
-        application = (
-            Application.builder()
-            .token(BOT_TOKEN)
-            .build()
-        )
-
+        application = Application.builder().token(BOT_TOKEN).build()
         application.add_handler(CommandHandler("start", cmd_start))
         application.add_handler(CommandHandler("prices", cmd_prices))
 
@@ -238,7 +314,7 @@ def run_bot() -> None:
                 replace_existing=True,
                 misfire_grace_time=300,
             )
-            logger.info("Scheduler started. Daily report scheduled at 00:00 Asia/Beirut (UTC+2).")
+            logger.info("Scheduler: daily report at 00:00 Asia/Beirut.")
         else:
             logger.warning("CHAT_ID not set — scheduled daily report disabled.")
         scheduler.start()
@@ -249,7 +325,6 @@ def run_bot() -> None:
             allowed_updates=["message"],
             drop_pending_updates=True,
         )
-
         logger.info("Bot polling started.")
         await asyncio.Event().wait()
 
@@ -264,7 +339,6 @@ def start_bot_thread() -> None:
     logger.info("Telegram bot thread started.")
 
 
-# Triggered at gunicorn import time
 start_bot_thread()
 
 if __name__ == "__main__":
