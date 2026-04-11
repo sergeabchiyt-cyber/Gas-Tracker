@@ -4,4 +4,5 @@ gevent==24.11.1
 python-telegram-bot==21.10
 APScheduler==3.10.4
 requests==2.32.3
+beautifulsoup4==4.12.3
 tzdata==2024.2
